@@ -97,7 +97,7 @@ if _is_blocksparse_available:
             self.requires_same_k_q_dimensions = True
 
             # The underlying triton op does not support per element attention mask
-            self.supports_attention_mask = False
+            self.supports_attention_mask = True
             self.supports_key_padding_mask = False
 
         def create_triton_kernels(self, device):
@@ -126,18 +126,18 @@ if _is_blocksparse_available:
                 device=device,
             )
 
+            self.non_zero_block_idx = self.layout.nonzero().T.to(device)
+
         def forward(
             self,
             q: torch.Tensor,
             k: torch.Tensor,
             v: torch.Tensor,
             scale: float = 1.0,
+            att_mask: torch.tensor = None,
             *args,
             **kwargs,
         ) -> torch.Tensor:
-            assert (
-                "att_mask" not in kwargs.keys() and "att_mask" not in args
-            ), "This attention does not support an attention mask, but you can specify causality."
 
             r"""
             A thin wrap around the Triton blockparse attention operation
@@ -176,6 +176,31 @@ if _is_blocksparse_available:
             # - (sparse) attention matrix = (dense) Kt * (dense) Q
             q = q / math.sqrt(q.size(-1))
             sparse_att_mat = self.sparse_dot_sdd(q, k)
+
+            # apply masks
+            if att_mask is not None:
+                # mask shape is (B, nh, S, S)
+                assert (
+                    att_mask.shape[0] == q.shape[0]
+                    and att_mask.shape[1] == q.shape[1]
+                    and att_mask.shape[2] == q.shape[-2]
+                    and att_mask.shape[3] == q.shape[-2]
+                )
+
+                # reshape input mask into blocks (B, nh, S, S) -> (B, nh, vertical_blocks, horizontal_blocks, block_size, block_size)
+                block_att_mask = att_mask.reshape(
+                    att_mask.shape[0],
+                    att_mask.shape[1],
+                    att_mask.shape[-1] // self.block_size,
+                    att_mask.shape[-1] // self.block_size,
+                    self.block_size,
+                    self.block_size,
+                )
+                
+                # gather based on predefined layout. non_zero_block_idx is (head, block_row, block_col)
+                block_att_mask = block_att_mask[:, self.non_zero_block_idx[0], self.non_zero_block_idx[1], self.non_zero_block_idx[2]]
+
+                sparse_att_mat += block_att_mask
 
             # - softmax on the sparse attention matrix
             sparse_att_mat = self.sparse_softmax(
